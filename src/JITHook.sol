@@ -4,31 +4,45 @@ pragma solidity 0.8.26;
 import {BaseHook} from "v4-periphery/src/base/hooks/BaseHook.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
-import {IProtocol} from "src/IProtocol.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/types/BeforeSwapDelta.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {ERC20} from "solmate/src/tokens/ERC20.sol";
 import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
-
-
+import {IStrategiesController} from "./interfaces/IStrategiesController.sol";
+import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import {IStrategy} from "./interfaces/IStrategy.sol";
+import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
+import {Actions} from "v4-periphery/src/libraries/Actions.sol";
 
 contract JITHook is BaseHook {
-
-    uint256 immutable threshold;
-
     using PoolIdLibrary for PoolId;
     using CurrencyLibrary for Currency;
     using BeforeSwapDeltaLibrary for BeforeSwapDelta;
 
-    IProtocol public yeildProtocol;
-    // IPoolManager public poolManager;
+    AggregatorV3Interface public token0PriceFeed;
+    AggregatorV3Interface public token1PriceFeed;
 
-    constructor(IPoolManager _manager, IProtocol _yeildProtocol, uint256 _threshold) BaseHook(_manager) {
-        yeildProtocol = _yeildProtocol;
-        poolManager = _manager;
-        threshold = _threshold;
+    uint256 public swapThreshold; // swap threshold in USD (8 decimals)
+    IStrategiesController public controller;
+    IPositionManager public positionManager;
+    uint256 public currentPositionId;
+    uint256 public currentActiveStrategyId;
+
+    constructor(
+        IPoolManager _manager,
+        address _strategiesController,
+        uint256 _threshold,
+        address _token0PriceFeed,
+        address _token1PriceFeed,
+        address _posManager
+    ) BaseHook(_manager) {
+        controller = IStrategiesController(_strategiesController);
+        swapThreshold = _threshold;
+        token0PriceFeed = AggregatorV3Interface(_token0PriceFeed);
+        token1PriceFeed = AggregatorV3Interface(_token1PriceFeed);
+        positionManager = IPositionManager(_posManager);
     }
 
     function getHookPermissions()
@@ -56,28 +70,72 @@ contract JITHook is BaseHook {
             });
     }
 
-    // if swap is big => remove lquidity from external protocol and add liquidity 
-    function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
-        external
-        override
-        returns (bytes4, BeforeSwapDelta, uint24)
-    {
-        if(uint256(params.amountSpecified) >= threshold) {
-            uint256 amountWithdrawn = _withdrawFromExternalProtocol();
-            // todo add amount0 and amount1
-            _addLiquidityToPool(poolManager, key, 0, 0);
+    // if swap is big => remove lquidity from external protocol and add liquidity
+    function beforeSwap(
+        address,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata params,
+        bytes calldata
+    ) external override returns (bytes4, BeforeSwapDelta, uint24) {
+        // 1. detect big swap
+        // 2. remove liquidity from external protocol
+        // 3. add liquidity to pool
+
+        uint256 precision;
+        int256 price;
+        int256 amountSpecified = params.amountSpecified;
+        uint256 token0Decimals = ERC20(Currency.unwrap(key.currency0))
+            .decimals();
+        uint256 token1Decimals = ERC20(Currency.unwrap(key.currency1))
+            .decimals();
+
+        if (params.zeroForOne) {
+            if (params.amountSpecified < 0) {
+                precision = 10 ** token0Decimals;
+                amountSpecified = -amountSpecified;
+                (, price, , , ) = token0PriceFeed.latestRoundData();
+            } else {
+                precision = 10 ** token1Decimals;
+                (, price, , , ) = token1PriceFeed.latestRoundData();
+            }
+        } else {
+            if (params.amountSpecified < 0) {
+                amountSpecified = -amountSpecified;
+                precision = 10 ** token1Decimals;
+                (, price, , , ) = token1PriceFeed.latestRoundData();
+            } else {
+                precision = 10 ** token0Decimals;
+                (, price, , , ) = token0PriceFeed.latestRoundData();
+            }
         }
+
+        // this should be in USD (8 decimals)
+        uint256 amountToSwap = (uint256(amountSpecified) * uint256(price)) / precision;
+
+        if (amountToSwap >= swapThreshold) {
+            uint256 amountWithdrawn = _withdrawFromStrategy(
+                currentActiveStrategyId
+            );
+            // TODO add amount0 and amount1
+            _addLiquidityToPool(key, 0, 0, 0, 0, 0);
+        }
+
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
     // remove liquidity from pool and add to external protocol
-    function afterSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata, BalanceDelta, bytes calldata)
-        external
-        override
-        returns (bytes4, int128)
-    {
-        _removeLiquidityFromPool(poolManager, key, 0);
-        _depositToExternalProtocol(address(this), 0);
+    function afterSwap(
+        address,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata,
+        BalanceDelta,
+        bytes calldata
+    ) external override returns (bytes4, int128) {
+        // 1. remove liquidity from pool
+        // 2. add liquidity to external protocol
+
+        _removeLiquidityFromPool(0, 0);
+        //_depositToStrategy(_id, _token, _amount);
         return (this.afterSwap.selector, 0);
     }
 
@@ -90,39 +148,58 @@ contract JITHook is BaseHook {
     // redeem what ? yeild tokens from external protocol OR swap fees ?
     function redeem() external {}
 
-    function _depositToExternalProtocol(address user, uint256 amount) internal {
-        yeildProtocol.deposit(address(this), amount);
+    function _depositToStrategy(
+        uint256 _id,
+        address _token,
+        uint256 _amount
+    ) internal {
+        IStrategy(controller.getStrategyAddress(_id)).deposit(_token, _amount);
     }
 
-    function _withdrawFromExternalProtocol() internal returns (uint256) {
-        yeildProtocol.withdraw(address(this));
+    function _withdrawFromStrategy(uint256 _id) internal returns (uint256) {
+        return IStrategy(controller.getStrategyAddress(_id)).withdraw();
     }
 
-    function _addLiquidityToPool(IPoolManager PoolManager, PoolKey memory key, uint256 amount0, uint256 amount1) internal returns (int256 liquidityDelta) {
+    function _addLiquidityToPool(
+        PoolKey memory key,
+        int24 tickLower,
+        int24 tickUpper,
+        int256 liquidity,
+        uint128 amount0Max,
+        uint128 amount1Max
+    ) internal returns (int256 liquidityDelta) {
+        bytes memory actions = abi.encodePacked(
+            Actions.MINT_POSITION,
+            Actions.SETTLE_PAIR
+        );
+        bytes[] memory params = new bytes[](2);
+        params[0] = abi.encode(
+            key,
+            tickLower,
+            tickUpper,
+            liquidity,
+            amount0Max,
+            amount1Max,
+            address(this),
+            ""
+        );
 
-        ERC20(Currency.unwrap(key.currency0)).approve(address(poolManager), amount0);
-        ERC20(Currency.unwrap(key.currency1)).approve(address(poolManager), amount1);
-        // todo set tick upper and lower for params in both add and rmeove liquidity from pool
-        IPoolManager.ModifyLiquidityParams memory params = IPoolManager.ModifyLiquidityParams({ 
-            tickLower: 0,
-            tickUpper: 0,
-            liquidityDelta: 0,
-            salt: bytes32(0)
-        });
+        params[1] = abi.encode(key.currency0, key.currency1);
 
-        poolManager.modifyLiquidity(key, params, "");
+        positionManager.modifyLiquiditiesWithoutUnlock(actions, params);
+
+        currentPositionId = positionManager.nextTokenId() - 1;
     }
 
-    function _removeLiquidityFromPool(IPoolManager PoolManager, PoolKey memory key, uint256 liquidityPercentage) internal returns (uint256 amount0, uint256 amount1) {
-        IPoolManager.ModifyLiquidityParams memory params = IPoolManager.ModifyLiquidityParams({
-            tickLower: 0,
-            tickUpper: 0,
-            liquidityDelta: 0,
-            salt: bytes32(0)
-        });
+    function _removeLiquidityFromPool(
+        uint128 amount0Min,
+        uint128 amount1Min
+    ) internal returns (uint256 amount0, uint256 amount1) {
+        bytes memory actions = abi.encodePacked(Actions.BURN_POSITION);
+        bytes[] memory params = new bytes[](1);
+        params[0] = abi.encode(currentPositionId, amount0Min, amount1Min, "");
+        delete currentPositionId;
 
-        (BalanceDelta delta, BalanceDelta feesAccrued) = poolManager.modifyLiquidity(key, params, "");
-        amount0 = uint256(int256((-delta.amount0())));
-        amount1 = uint256(int256((-delta.amount1())));
+        positionManager.modifyLiquiditiesWithoutUnlock(actions, params);
     }
 }

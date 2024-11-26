@@ -117,6 +117,7 @@ contract JITHook is BaseHook {
                 currentActiveStrategyId
             );
             // TODO add amount0 and amount1
+            // who decides the liquidity range before adding liqudity?
             _addLiquidityToPool(key, 0, 0, 0, 0, 0);
         }
 
@@ -136,14 +137,32 @@ contract JITHook is BaseHook {
 
         _removeLiquidityFromPool(0, 0);
         //_depositToStrategy(_id, _token, _amount);
+        // fee distribution ???????????
         return (this.afterSwap.selector, 0);
     }
 
     // smaller LPs will call this function, funds added to external protocol
-    function deposit() external {}
+    function deposit(uint256 amount0, uint256 amount1, PoolKey calldata key) external {
+        ERC20(Currency.unwrap(key.currency0)).transferFrom(msg.sender, address(this), amount0);
+        ERC20(Currency.unwrap(key.currency1)).transferFrom(msg.sender, address(this), amount1);
+
+        if(amount0 > 0) {
+            _depositToStrategy(currentActiveStrategyId, key.currency0, amount0);
+        } 
+        if(amount1 > 0) {
+            _depositToStrategy(currentActiveStrategyId, key.currency1, amount1);
+        }
+
+        // todo emit event
+    }
 
     // funds transferred to small LPs from external protocol
-    function withdraw() external {}
+    function withdraw(uint256 amount0, uint256 amount1, PoolKey calldata key) external {
+        uint256 withdrawAmount = _withdrawFromStrategy(currentActiveStrategyId);
+
+        // todo calculate token amount for the user, and transfer to user 
+        // todo multiple user wil store funds here, when one user call this only his liquidty should be removed and transferred to user NOT ALL
+    }
 
     // redeem what ? yeild tokens from external protocol OR swap fees ?
     function redeem() external {}
@@ -168,6 +187,7 @@ contract JITHook is BaseHook {
         uint128 amount0Max,
         uint128 amount1Max
     ) internal returns (int256 liquidityDelta) {
+        // note mint liquidity or add liquidity, liquidity will be provided by non JIT LPs as well ? 
         bytes memory actions = abi.encodePacked(
             Actions.MINT_POSITION,
             Actions.SETTLE_PAIR
@@ -195,6 +215,7 @@ contract JITHook is BaseHook {
         uint128 amount0Min,
         uint128 amount1Min
     ) internal returns (uint256 amount0, uint256 amount1) {
+        // decrease liquidity + take pair (transfer fee revenue) ? OR directly burn position
         bytes memory actions = abi.encodePacked(Actions.BURN_POSITION);
         bytes[] memory params = new bytes[](1);
         params[0] = abi.encode(currentPositionId, amount0Min, amount1Min, "");

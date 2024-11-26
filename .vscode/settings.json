@@ -1,4 +1,5 @@
 {
     "solidity.compileUsingRemoteVersion": "v0.8.26+commit.8a97fa7a",
-    "solidity.defaultCompiler": "localNodeModule"
+    "solidity.defaultCompiler": "localNodeModule",
+    "solidity.compileUsingLocalVersion": "/home/eric/JIT-Hook/soljson-v0.8.26+commit.8a97fa7a.js"
 }

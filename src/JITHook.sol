@@ -2,19 +2,21 @@
 pragma solidity 0.8.26;
 
 import {BaseHook} from "v4-periphery/src/base/hooks/BaseHook.sol";
-import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
-import {Hooks} from "v4-core/libraries/Hooks.sol";
-import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
-import {PoolKey} from "v4-core/types/PoolKey.sol";
-import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/types/BeforeSwapDelta.sol";
-import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {Hooks} from "v4-core/src/libraries/Hooks.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
+import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/src/types/BeforeSwapDelta.sol";
+import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {ERC20} from "solmate/src/tokens/ERC20.sol";
-import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
+import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {IStrategiesController} from "./interfaces/IStrategiesController.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import {IStrategy} from "./interfaces/IStrategy.sol";
 import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
 import {Actions} from "v4-periphery/src/libraries/Actions.sol";
+import {LiquidityAmounts} from "v4-core/test/utils/LiquidityAmounts.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 
 contract JITHook is BaseHook {
     using PoolIdLibrary for PoolId;
@@ -183,7 +185,6 @@ contract JITHook is BaseHook {
         PoolKey memory key,
         int24 tickLower,
         int24 tickUpper,
-        int256 liquidity,
         uint128 amount0Max,
         uint128 amount1Max
     ) internal returns (int256 liquidityDelta) {
@@ -193,6 +194,14 @@ contract JITHook is BaseHook {
             Actions.SETTLE_PAIR
         );
         bytes[] memory params = new bytes[](2);
+
+        int256 liquidity = LiquidityAmounts.getLiquidityForAmounts(
+            TickMath.getSqrtRatioAtTick(tickLower),
+            TickMath.getSqrtRatioAtTick(tickUpper),
+            amount0Max,
+            amount1Max
+        );
+        
         params[0] = abi.encode(
             key,
             tickLower,

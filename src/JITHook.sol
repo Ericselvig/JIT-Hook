@@ -17,10 +17,11 @@ import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol
 import {Actions} from "v4-periphery/src/libraries/Actions.sol";
 import {LiquidityAmounts} from "v4-core/test/utils/LiquidityAmounts.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
-import {GovToken} from "./GovToken.sol";
+import {GovToken} from "./governance/GovToken.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 
 contract JITHook is BaseHook {
-    
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
     using BeforeSwapDeltaLibrary for BeforeSwapDelta;
@@ -35,7 +36,7 @@ contract JITHook is BaseHook {
     uint256 public currentActiveStrategyId;
 
     // mapping(PoolKey => GovToken) public govTokens;
-    mapping(PoolId => GovToken) public govTokens; 
+    mapping(PoolId => GovToken) public govTokens;
 
     constructor(
         IPoolManager _manager,
@@ -77,10 +78,25 @@ contract JITHook is BaseHook {
             });
     }
 
-    function afterInitialize(address, PoolKey calldata key, uint160, int24) external virtual returns (bytes4) {
-        string memory name = string.concat("Governance token: ", key.currency0.symbol, "-", key.currency1.symbol);
-        string memory symbol = string.concat(key.currency0.symbol, "-", key.currency1.symbol);
-        govTokens[key] = new GovToken(name, symbol);
+    function afterInitialize(
+        address,
+        PoolKey calldata key,
+        uint160,
+        int24
+    ) external override returns (bytes4) {
+        string memory name = string.concat(
+            "Governance token: ",
+            ERC20(Currency.unwrap(key.currency0)).symbol(),
+            "-",
+            ERC20(Currency.unwrap(key.currency1)).symbol()
+        );
+        string memory symbol = string.concat(
+            ERC20(Currency.unwrap(key.currency0)).symbol(),
+            "-",
+            ERC20(Currency.unwrap(key.currency1)).symbol()
+        );
+        govTokens[key.toId()] = new GovToken(name, symbol);
+
         return this.afterInitialize.selector;
     }
 
@@ -124,15 +140,18 @@ contract JITHook is BaseHook {
         }
 
         // this should be in USD (8 decimals)
-        uint256 amountToSwap = (uint256(amountSpecified) * uint256(price)) / precision;
+        uint256 amountToSwap = (uint256(amountSpecified) * uint256(price)) /
+            precision;
 
         if (amountToSwap >= swapThreshold) {
             uint256 amountWithdrawn = _withdrawFromStrategy(
-                currentActiveStrategyId
+                currentActiveStrategyId,
+                key.currency0,
+                0
             );
             // TODO add amount0 and amount1
             // who decides the liquidity range before adding liqudity?
-            _addLiquidityToPool(key, 0, 0, 0, 0, 0);
+            _addLiquidityToPool(key, 0, 0, 0, 0);
         }
 
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
@@ -157,31 +176,46 @@ contract JITHook is BaseHook {
 
     // smaller LPs will call this function, funds added to external protocol
     // note the user must deposit the pair of funds to the hook with the same ratio as the pool, otherwise it will not be accepted
-    function deposit(uint256 amount0, uint256 amount1, PoolKey calldata key) external {
+    function deposit(
+        uint256 amount0,
+        uint256 amount1,
+        PoolKey calldata key
+    ) external {
         // getting price from pool manager
-        (, int24 tick, , , , ) = poolManager.getSlot0(key.toId());
-        uint160 sqrtPriceX96 = TickMath.getSqrtRatioAtTick(tick);
+        (, int24 tick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
+        uint160 sqrtPriceX96 = TickMath.getSqrtPriceAtTick(tick);
         // note not sure about the math here ?
-        uint256 price = uint256(sqrtPriceX96)  * uint256(sqrtPriceX96) * 1e18 >> 192;
+        uint256 price = (uint256(sqrtPriceX96) *
+            uint256(sqrtPriceX96) *
+            1e18) >> 192;
         uint256 expectedAmount1 = (amount0 * price) / 1e18;
         uint256 expectedAmount0 = (amount1 * 1e18) / price;
         // 2% tolerance
         require(
-            amount0 >= expectedAmount0 * 98 / 100 && 
-            amount0 <= expectedAmount0 * 101 / 100 && 
-            amount1 >= expectedAmount1 * 98 / 100 && 
-            amount1 <= expectedAmount1 * 101 / 100, 
-            "amount not in pool ratio");
+            amount0 >= (expectedAmount0 * 98) / 100 &&
+                amount0 <= (expectedAmount0 * 101) / 100 &&
+                amount1 >= (expectedAmount1 * 98) / 100 &&
+                amount1 <= (expectedAmount1 * 101) / 100,
+            "amount not in pool ratio"
+        );
         // require(amount1 >= expectedAmount1 * 98 / 100 && amount1 <= expectedAmount1 * 101 / 100, "amounts too small");
 
-        ERC20(Currency.unwrap(key.currency0)).transferFrom(msg.sender, address(this), amount0);
-        ERC20(Currency.unwrap(key.currency1)).transferFrom(msg.sender, address(this), amount1);
+        ERC20(Currency.unwrap(key.currency0)).transferFrom(
+            msg.sender,
+            address(this),
+            amount0
+        );
+        ERC20(Currency.unwrap(key.currency1)).transferFrom(
+            msg.sender,
+            address(this),
+            amount1
+        );
 
-        if(amount0 > 0) {
+        if (amount0 > 0) {
             _depositToStrategy(currentActiveStrategyId, key.currency0, amount0);
             govTokens[key.toId()].mint(msg.sender, amount0);
-        } 
-        if(amount1 > 0) {
+        }
+        if (amount1 > 0) {
             _depositToStrategy(currentActiveStrategyId, key.currency1, amount1);
             govTokens[key.toId()].mint(msg.sender, amount1);
         }
@@ -190,14 +224,23 @@ contract JITHook is BaseHook {
     }
 
     // funds transferred to small LPs from external protocol
-    function withdraw(uint256 amount0, uint256 amount1, PoolKey calldata key) external {
-        address token0 = Currency.unwrap(key.currency0);
-        address token1 = Currency.unwrap(key.currency1);
-        uint256 withdrawAmountToken0 = _withdrawFromStrategy(currentActiveStrategyId, token0, amount0);
-        uint256 withdrawAmountToken1 = _withdrawFromStrategy(currentActiveStrategyId, token1, amount1); 
-        
+    function withdraw(
+        uint256 amount0,
+        uint256 amount1,
+        PoolKey calldata key
+    ) external {
+        uint256 withdrawAmountToken0 = _withdrawFromStrategy(
+            currentActiveStrategyId,
+            key.currency0,
+            amount0
+        );
+        uint256 withdrawAmountToken1 = _withdrawFromStrategy(
+            currentActiveStrategyId,
+            key.currency1,
+            amount1
+        );
 
-        // todo calculate token amount for the user, and transfer to user 
+        // todo calculate token amount for the user, and transfer to user
         // todo multiple user wil store funds here, when one user call this only his liquidty should be removed and transferred to user NOT ALL
     }
 
@@ -206,14 +249,24 @@ contract JITHook is BaseHook {
 
     function _depositToStrategy(
         uint256 _id,
-        address _token,
+        Currency _currency,
         uint256 _amount
     ) internal {
+        address _token = Currency.unwrap(_currency);
         IStrategy(controller.getStrategyAddress(_id)).deposit(_token, _amount);
     }
 
-    function _withdrawFromStrategy(uint256 _id, address token, uint256 amount) internal returns (uint256) {
-        return IStrategy(controller.getStrategyAddress(_id)).withdraw(token, amount);
+    function _withdrawFromStrategy(
+        uint256 _id,
+        Currency _currency,
+        uint256 amount
+    ) internal returns (uint256) {
+        address token = Currency.unwrap(_currency);
+        return
+            IStrategy(controller.getStrategyAddress(_id)).withdraw(
+                token,
+                amount
+            );
     }
 
     function _addLiquidityToPool(
@@ -223,20 +276,23 @@ contract JITHook is BaseHook {
         uint128 amount0Max,
         uint128 amount1Max
     ) internal returns (int256 liquidityDelta) {
-        // note mint liquidity or add liquidity, liquidity will be provided by non JIT LPs as well ? 
+        // note mint liquidity or add liquidity, liquidity will be provided by non JIT LPs as well ?
         bytes memory actions = abi.encodePacked(
             Actions.MINT_POSITION,
             Actions.SETTLE_PAIR
         );
         bytes[] memory params = new bytes[](2);
 
-        int256 liquidity = LiquidityAmounts.getLiquidityForAmounts(
-            TickMath.getSqrtRatioAtTick(tickLower),
-            TickMath.getSqrtRatioAtTick(tickUpper),
+        (,int24 currTick,,) = StateLibrary.getSlot0(poolManager, key.toId());
+
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
+            TickMath.getSqrtPriceAtTick(currTick),
+            TickMath.getSqrtPriceAtTick(tickLower),
+            TickMath.getSqrtPriceAtTick(tickUpper),
             amount0Max,
             amount1Max
         );
-        
+
         params[0] = abi.encode(
             key,
             tickLower,

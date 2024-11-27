@@ -20,7 +20,8 @@ import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {GovToken} from "./GovToken.sol";
 
 contract JITHook is BaseHook {
-    using PoolIdLibrary for PoolId;
+    
+    using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
     using BeforeSwapDeltaLibrary for BeforeSwapDelta;
 
@@ -33,8 +34,8 @@ contract JITHook is BaseHook {
     uint256 public currentPositionId;
     uint256 public currentActiveStrategyId;
 
-    mapping(PoolKey => GovToken) public govTokens;
-    // mapping(PoolId => GovToken) public govTokens; 
+    // mapping(PoolKey => GovToken) public govTokens;
+    mapping(PoolId => GovToken) public govTokens; 
 
     constructor(
         IPoolManager _manager,
@@ -155,17 +156,34 @@ contract JITHook is BaseHook {
     }
 
     // smaller LPs will call this function, funds added to external protocol
+    // note the user must deposit the pair of funds to the hook with the same ratio as the pool, otherwise it will not be accepted
     function deposit(uint256 amount0, uint256 amount1, PoolKey calldata key) external {
+        // getting price from pool manager
+        (, int24 tick, , , , ) = poolManager.getSlot0(key.toId());
+        uint160 sqrtPriceX96 = TickMath.getSqrtRatioAtTick(tick);
+        // note not sure about the math here ?
+        uint256 price = uint256(sqrtPriceX96)  * uint256(sqrtPriceX96) * 1e18 >> 192;
+        uint256 expectedAmount1 = (amount0 * price) / 1e18;
+        uint256 expectedAmount0 = (amount1 * 1e18) / price;
+        // 2% tolerance
+        require(
+            amount0 >= expectedAmount0 * 98 / 100 && 
+            amount0 <= expectedAmount0 * 101 / 100 && 
+            amount1 >= expectedAmount1 * 98 / 100 && 
+            amount1 <= expectedAmount1 * 101 / 100, 
+            "amount not in pool ratio");
+        // require(amount1 >= expectedAmount1 * 98 / 100 && amount1 <= expectedAmount1 * 101 / 100, "amounts too small");
+
         ERC20(Currency.unwrap(key.currency0)).transferFrom(msg.sender, address(this), amount0);
         ERC20(Currency.unwrap(key.currency1)).transferFrom(msg.sender, address(this), amount1);
 
         if(amount0 > 0) {
             _depositToStrategy(currentActiveStrategyId, key.currency0, amount0);
-            govTokens[key].mint(msg.sender, amount0);
+            govTokens[key.toId()].mint(msg.sender, amount0);
         } 
         if(amount1 > 0) {
             _depositToStrategy(currentActiveStrategyId, key.currency1, amount1);
-            govTokens[key].mint(msg.sender, amount1);
+            govTokens[key.toId()].mint(msg.sender, amount1);
         }
 
         // todo emit event
@@ -175,8 +193,9 @@ contract JITHook is BaseHook {
     function withdraw(uint256 amount0, uint256 amount1, PoolKey calldata key) external {
         address token0 = Currency.unwrap(key.currency0);
         address token1 = Currency.unwrap(key.currency1);
-        uint256 withdrawAmount = _withdrawFromStrategy(currentActiveStrategyId, token0, amount0);
+        uint256 withdrawAmountToken0 = _withdrawFromStrategy(currentActiveStrategyId, token0, amount0);
         uint256 withdrawAmountToken1 = _withdrawFromStrategy(currentActiveStrategyId, token1, amount1); 
+        
 
         // todo calculate token amount for the user, and transfer to user 
         // todo multiple user wil store funds here, when one user call this only his liquidty should be removed and transferred to user NOT ALL

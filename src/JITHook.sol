@@ -17,6 +17,7 @@ import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol
 import {Actions} from "v4-periphery/src/libraries/Actions.sol";
 import {LiquidityAmounts} from "v4-core/test/utils/LiquidityAmounts.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {GovToken} from "./GovToken.sol";
 
 contract JITHook is BaseHook {
     using PoolIdLibrary for PoolId;
@@ -31,6 +32,9 @@ contract JITHook is BaseHook {
     IPositionManager public positionManager;
     uint256 public currentPositionId;
     uint256 public currentActiveStrategyId;
+
+    mapping(PoolKey => GovToken) public govTokens;
+    // mapping(PoolId => GovToken) public govTokens; 
 
     constructor(
         IPoolManager _manager,
@@ -56,7 +60,7 @@ contract JITHook is BaseHook {
         return
             Hooks.Permissions({
                 beforeInitialize: false,
-                afterInitialize: false,
+                afterInitialize: true,
                 beforeAddLiquidity: false,
                 afterAddLiquidity: false,
                 beforeRemoveLiquidity: false,
@@ -70,6 +74,13 @@ contract JITHook is BaseHook {
                 afterAddLiquidityReturnDelta: false,
                 afterRemoveLiquidityReturnDelta: false
             });
+    }
+
+    function afterInitialize(address, PoolKey calldata key, uint160, int24) external virtual returns (bytes4) {
+        string memory name = string.concat("Governance token: ", key.currency0.symbol, "-", key.currency1.symbol);
+        string memory symbol = string.concat(key.currency0.symbol, "-", key.currency1.symbol);
+        govTokens[key] = new GovToken(name, symbol);
+        return this.afterInitialize.selector;
     }
 
     // if swap is big => remove lquidity from external protocol and add liquidity
@@ -150,9 +161,11 @@ contract JITHook is BaseHook {
 
         if(amount0 > 0) {
             _depositToStrategy(currentActiveStrategyId, key.currency0, amount0);
+            govTokens[key].mint(msg.sender, amount0);
         } 
         if(amount1 > 0) {
             _depositToStrategy(currentActiveStrategyId, key.currency1, amount1);
+            govTokens[key].mint(msg.sender, amount1);
         }
 
         // todo emit event
@@ -160,7 +173,10 @@ contract JITHook is BaseHook {
 
     // funds transferred to small LPs from external protocol
     function withdraw(uint256 amount0, uint256 amount1, PoolKey calldata key) external {
-        uint256 withdrawAmount = _withdrawFromStrategy(currentActiveStrategyId);
+        address token0 = Currency.unwrap(key.currency0);
+        address token1 = Currency.unwrap(key.currency1);
+        uint256 withdrawAmount = _withdrawFromStrategy(currentActiveStrategyId, token0, amount0);
+        uint256 withdrawAmountToken1 = _withdrawFromStrategy(currentActiveStrategyId, token1, amount1); 
 
         // todo calculate token amount for the user, and transfer to user 
         // todo multiple user wil store funds here, when one user call this only his liquidty should be removed and transferred to user NOT ALL
@@ -177,8 +193,8 @@ contract JITHook is BaseHook {
         IStrategy(controller.getStrategyAddress(_id)).deposit(_token, _amount);
     }
 
-    function _withdrawFromStrategy(uint256 _id) internal returns (uint256) {
-        return IStrategy(controller.getStrategyAddress(_id)).withdraw();
+    function _withdrawFromStrategy(uint256 _id, address token, uint256 amount) internal returns (uint256) {
+        return IStrategy(controller.getStrategyAddress(_id)).withdraw(token, amount);
     }
 
     function _addLiquidityToPool(

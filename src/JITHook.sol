@@ -144,14 +144,57 @@ contract JITHook is BaseHook {
             precision;
 
         if (amountToSwap >= swapThreshold) {
-            uint256 amountWithdrawn = _withdrawFromStrategy(
-                currentActiveStrategyId,
-                key.currency0,
-                0
-            );
-            // TODO add amount0 and amount1
-            // who decides the liquidity range before adding liqudity?
-            _addLiquidityToPool(key, 0, 0, 0, 0);
+            // current price ratio
+            (, int24 tick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
+            uint160 sqrtPriceX96 = TickMath.getSqrtPriceAtTick(tick);
+            uint256 currentPoolPrice = (uint256(sqrtPriceX96) * uint256(sqrtPriceX96) * 1e18) >> 192;
+
+            // getting token balance deposit to external protocol (strategy balance)
+            uint256 token0Balance;
+            uint256 token1Balance;
+            (token0Balance, token1Balance) = _getBalanceFromStrategy(currentActiveStrategyId, key.currency0, key.currency1);
+
+            // check if we have enough funds to cover the swap before adding liquidity
+            int256 absAmountSpecified = params.amountSpecified < 0 ? -params.amountSpecified : params.amountSpecified;
+            require(token0Balance >= uint256(absAmountSpecified) || token1Balance >= (uint256(absAmountSpecified) * currentPoolPrice) / 1e18, "No balance");
+
+            // withdraw funds from external swap before adding to the pool
+            uint256 amountWithdrawn0 = _withdrawFromStrategy(currentActiveStrategyId, key.currency0, token0Balance);
+            uint256 amountWithdrawn1 = _withdrawFromStrategy(currentActiveStrategyId, key.currency1, token1Balance);
+
+            uint256 requiredAmount0AccordingToCurrentPoolRatio = (token1Balance * 1e18) / currentPoolPrice;
+            uint256 requiredAmount1AccordingToCurrentPoolRatio = (token0Balance * currentPoolPrice) / 1e18;
+
+            // check if internal swap is required before adding liquidity
+            if(token0Balance > requiredAmount0AccordingToCurrentPoolRatio) {
+                // swap token0 for token1
+                uint256 excessAmount0 =  token0Balance - requiredAmount0AccordingToCurrentPoolRatio;
+                poolManager.swap(
+                    key, 
+                    IPoolManager.SwapParams({
+                        zeroForOne: true, 
+                        amountSpecified: int256(excessAmount0), 
+                        sqrtPriceLimitX96: 0
+                    }),
+                    ""
+                );
+            } else if (token1Balance > requiredAmount1AccordingToCurrentPoolRatio) {
+                // swap token1 for token0
+                uint256 excessAmount1 =  token1Balance - requiredAmount1AccordingToCurrentPoolRatio;
+                poolManager.swap(
+                    key, 
+                    IPoolManager.SwapParams({
+                        zeroForOne: false, 
+                        amountSpecified: int256(excessAmount1), 
+                        sqrtPriceLimitX96: 0
+                    }),
+                    ""
+                );
+
+            }
+
+            // add liquidity to pool
+            _addLiquidityToPool(key, 0, 0, uint128(requiredAmount0AccordingToCurrentPoolRatio), uint128(requiredAmount1AccordingToCurrentPoolRatio));
         }
 
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
@@ -224,11 +267,26 @@ contract JITHook is BaseHook {
     }
 
     // funds transferred to small LPs from external protocol
+    // note what if when the user withdraw pair of tokens, that ratio is changed 
+    // we accept deposit in proper ratio so we must withdraw in current ratio as well
+    // INTERNAL SWAP 
     function withdraw(
         uint256 amount0,
         uint256 amount1,
         PoolKey calldata key
     ) external {
+
+        GovToken govToken = govTokens[key.toId()];
+        uint256 userBalance = govToken.balanceOf(msg.sender);
+        uint256 totalSupply = govToken.totalSupply();
+        uint256 userShare = (userBalance * 1e18) / totalSupply;
+        uint256 maxWithdrawAmountToken0 = (amount0 * userShare) / 1e18;
+        uint256 maxWithdrawAmountToken1 = (amount1 * userShare) / 1e18;
+
+        require(amount0 <= maxWithdrawAmountToken0 && amount1 <= maxWithdrawAmountToken1);
+        govToken.burn(msg.sender, amount0);
+        govToken.burn(msg.sender, amount1);
+        
         uint256 withdrawAmountToken0 = _withdrawFromStrategy(
             currentActiveStrategyId,
             key.currency0,
@@ -239,6 +297,8 @@ contract JITHook is BaseHook {
             key.currency1,
             amount1
         );
+        ERC20(Currency.unwrap(key.currency0)).transfer(msg.sender, withdrawAmountToken0);
+        ERC20(Currency.unwrap(key.currency1)).transfer(msg.sender, withdrawAmountToken1);
 
         // todo calculate token amount for the user, and transfer to user
         // todo multiple user wil store funds here, when one user call this only his liquidty should be removed and transferred to user NOT ALL
@@ -267,6 +327,16 @@ contract JITHook is BaseHook {
                 token,
                 amount
             );
+    }
+
+    function _getBalanceFromStrategy(
+        uint256 _id, 
+        Currency _currency0,
+        Currency _currency1
+    ) internal returns (uint256 balanceOfToken0, uint256 balanceOfToken1) {
+        address token0 = Currency.unwrap(_currency0);
+        address token1 = Currency.unwrap(_currency1);
+        (balanceOfToken0, balanceOfToken1) = IStrategy(controller.getStrategyAddress(_id)).getBalance(token0, token1);
     }
 
     function _addLiquidityToPool(

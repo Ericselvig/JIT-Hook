@@ -155,7 +155,7 @@ contract JITHook is BaseHook {
             (token0Balance, token1Balance) = _getBalanceFromStrategy(currentActiveStrategyId, key.currency0, key.currency1);
 
             // check if we have enough funds to cover the swap before adding liquidity
-            int256 absAmountSpecified = params.amountSpecified < 0 ? -params.amountSpecified : params.amountSpecified;
+            int256 absAmountSpecified = amountSpecified < 0 ? -amountSpecified : amountSpecified;
             require(token0Balance >= uint256(absAmountSpecified) || token1Balance >= (uint256(absAmountSpecified) * currentPoolPrice) / 1e18, "No balance");
 
             // withdraw funds from external swap before adding to the pool

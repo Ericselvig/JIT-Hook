@@ -21,6 +21,7 @@ import {GovToken} from "./governance/GovToken.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {Owned} from "solmate/src/auth/Owned.sol";
+import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
 /**
  * @title JITHook
@@ -36,20 +37,25 @@ contract JITHook is BaseHook, Owned {
     error Slippage_Too_High();
 
     mapping(Currency currency => AggregatorV3Interface priceFeed) priceFeeds;
+    // TODO pool => strategy ID
 
     uint256 public swapThreshold; // swap threshold in USD (8 decimals)
     IStrategiesController public controller;
     IPositionManager public positionManager;
     uint256 public currentPositionId;
+
+    // TODO remove
     uint256 public currentActiveStrategyId;
 
     // mapping(PoolKey => GovToken) public govTokens;
     mapping(PoolId => GovToken) public govTokens;
 
-    constructor(IPoolManager _manager, address _strategiesController, uint256 _threshold, address _posManager)
-        BaseHook(_manager)
-        Owned(msg.sender)
-    {
+    constructor(
+        IPoolManager _manager,
+        address _strategiesController,
+        uint256 _threshold,
+        address _posManager
+    ) BaseHook(_manager) Owned(msg.sender) {
         controller = IStrategiesController(_strategiesController);
         swapThreshold = _threshold;
         positionManager = IPositionManager(_posManager);
@@ -60,41 +66,59 @@ contract JITHook is BaseHook, Owned {
      * @param currency the currency for which the price feed is to be set
      * @param priceFeed the address of the chainlink price feed
      */
-    function setPriceFeed(Currency currency, address priceFeed) external onlyOwner {
+    function setPriceFeed(
+        Currency currency,
+        address priceFeed
+    ) external onlyOwner {
         priceFeeds[currency] = AggregatorV3Interface(priceFeed);
     }
 
-    function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
-        return Hooks.Permissions({
-            beforeInitialize: false,
-            afterInitialize: true,
-            beforeAddLiquidity: false,
-            afterAddLiquidity: false,
-            beforeRemoveLiquidity: false,
-            afterRemoveLiquidity: false,
-            beforeSwap: true,
-            afterSwap: true,
-            beforeDonate: false,
-            afterDonate: false,
-            beforeSwapReturnDelta: false,
-            afterSwapReturnDelta: false,
-            afterAddLiquidityReturnDelta: false,
-            afterRemoveLiquidityReturnDelta: false
-        });
+    function getHookPermissions()
+        public
+        pure
+        override
+        returns (Hooks.Permissions memory)
+    {
+        return
+            Hooks.Permissions({
+                beforeInitialize: false,
+                afterInitialize: true,
+                beforeAddLiquidity: false,
+                afterAddLiquidity: false,
+                beforeRemoveLiquidity: false,
+                afterRemoveLiquidity: false,
+                beforeSwap: true,
+                afterSwap: true,
+                beforeDonate: false,
+                afterDonate: false,
+                beforeSwapReturnDelta: false,
+                afterSwapReturnDelta: false,
+                afterAddLiquidityReturnDelta: false,
+                afterRemoveLiquidityReturnDelta: false
+            });
     }
 
     /**
      * @dev hook to initialize the governance token for a pool
      */
-    function afterInitialize(address, PoolKey calldata key, uint160, int24) external override returns (bytes4) {
+    function afterInitialize(
+        address,
+        PoolKey calldata key,
+        uint160,
+        int24
+    ) external override returns (bytes4) {
         string memory name = string.concat(
             "Governance token: ",
             ERC20(Currency.unwrap(key.currency0)).symbol(),
             "-",
-            ERC20(Currency.unwrap(key.currency1)).symbol()
+            ERC20(Currency.unwrap(key.currency1)).symbol(),
+            Strings.toString(key.fee)
         );
         string memory symbol = string.concat(
-            ERC20(Currency.unwrap(key.currency0)).symbol(), "-", ERC20(Currency.unwrap(key.currency1)).symbol()
+            ERC20(Currency.unwrap(key.currency0)).symbol(),
+            "-",
+            ERC20(Currency.unwrap(key.currency1)).symbol(),
+            Strings.toString(key.fee)
         );
         govTokens[key.toId()] = new GovToken(name, symbol);
 
@@ -104,34 +128,35 @@ contract JITHook is BaseHook, Owned {
     /**
      * @dev detect big swap and provide liquidity to the pool
      */
-    function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
-        external
-        override
-        returns (bytes4, BeforeSwapDelta, uint24)
-    {
-        // 1. detect big swap
-        // 2. remove liquidity from external protocol
-        // 3. add liquidity to pool
+    function beforeSwap(
+        address,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata params,
+        bytes calldata
+    ) external override returns (bytes4, BeforeSwapDelta, uint24) {
         if (msg.sender == address(this)) {
-            return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+            return (
+                this.beforeSwap.selector,
+                BeforeSwapDeltaLibrary.ZERO_DELTA,
+                0
+            );
         }
 
         if (_getSwapAmount(key, params) >= swapThreshold) {
-            // check if hook is liquid
-            if (!_checkIfHookHasEnoughBalance(key, params)) {
-                return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
-            }
-
             // withdraw funds from external swap before adding to the pool and
             // check if internal swap is required before adding liquidity
-            (uint256 requiredAmount0AccordingToCurrentPoolRatio, uint256 requiredAmount1AccordingToCurrentPoolRatio) =
-                _withdrawAndSwap(key);
+            (
+                uint256 requiredAmount0AccordingToCurrentPoolRatio,
+                uint256 requiredAmount1AccordingToCurrentPoolRatio
+            ) = _withdrawAndSwap(key);
+
+            (, int24 tick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
 
             // add liquidity to pool
             _addLiquidityToPool(
                 key,
-                0,
-                0,
+                tick - key.tickSpacing,
+                tick + key.tickSpacing,
                 uint128(requiredAmount0AccordingToCurrentPoolRatio),
                 uint128(requiredAmount1AccordingToCurrentPoolRatio)
             );
@@ -141,49 +166,49 @@ contract JITHook is BaseHook, Owned {
     }
 
     // remove liquidity from pool and add to external protocol
-    function afterSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata, BalanceDelta, bytes calldata)
-        external
-        override
-        returns (bytes4, int128)
-    {
+    function afterSwap(
+        address,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata,
+        BalanceDelta,
+        bytes calldata
+    ) external override returns (bytes4, int128) {
         // 1. remove liquidity from pool
         // 2. add liquidity to external protocol
 
+        // TODO are 0, 0 ok?
         _removeLiquidityFromPool(0, 0);
-        //_depositToStrategy(_id, _token, _amount);
+        _depositToStrategy(
+            currentActiveStrategyId,
+            key.currency0,
+            IERC20(Currency.unwrap(key.currency0)).balanceOf(address(this))
+        );
+        _depositToStrategy(
+            currentActiveStrategyId,
+            key.currency1,
+            IERC20(Currency.unwrap(key.currency1)).balanceOf(address(this))
+        );
+
         // fee distribution ???????????
         return (this.afterSwap.selector, 0);
     }
 
     // smaller LPs will call this function, funds added to external protocol
     // note the user must deposit the pair of funds to the hook with the same ratio as the pool, otherwise it will not be accepted
-    function deposit(uint256 amount0, uint256 amount1, PoolKey calldata key) external {
-        // getting price from pool manager
-        (, int24 tick,,) = StateLibrary.getSlot0(poolManager, key.toId());
-        uint160 sqrtPriceX96 = TickMath.getSqrtPriceAtTick(tick);
-        // note not sure about the math here ?
-        uint256 price = (uint256(sqrtPriceX96) * uint256(sqrtPriceX96) * 1e18) >> 192;
-        uint256 expectedAmount1 = (amount0 * price) / 1e18;
-        uint256 expectedAmount0 = (amount1 * 1e18) / price;
-        // 2% tolerance
-        if (
-            amount0 < (expectedAmount0 * 98) / 100 || amount0 > (expectedAmount0 * 101) / 100
-                || amount1 < (expectedAmount1 * 98) / 100 || amount1 > (expectedAmount1 * 101) / 100
-        ) {
-            revert Slippage_Too_High();
-        }
-        // require(amount1 >= expectedAmount1 * 98 / 100 && amount1 <= expectedAmount1 * 101 / 100, "amounts too small");
+    function deposit(
+        Currency currency,
+        uint256 amount
+    ) external {
+        ERC20(Currency.unwrap(currency)).transferFrom(
+            msg.sender,
+            address(this),
+            amount
+        );
 
-        ERC20(Currency.unwrap(key.currency0)).transferFrom(msg.sender, address(this), amount0);
-        ERC20(Currency.unwrap(key.currency1)).transferFrom(msg.sender, address(this), amount1);
-
-        if (amount0 > 0) {
-            _depositToStrategy(currentActiveStrategyId, key.currency0, amount0);
+        // TODO instead of minting amounts directly, calculate the total USD value and mint that
+        if (amount > 0) {
+            _depositToStrategy(currentActiveStrategyId, currency, amount);
             govTokens[key.toId()].mint(msg.sender, amount0);
-        }
-        if (amount1 > 0) {
-            _depositToStrategy(currentActiveStrategyId, key.currency1, amount1);
-            govTokens[key.toId()].mint(msg.sender, amount1);
         }
 
         // todo emit event
@@ -193,22 +218,32 @@ contract JITHook is BaseHook, Owned {
     // note what if when the user withdraw pair of tokens, that ratio is changed
     // we accept deposit in proper ratio so we must withdraw in current ratio as well
     // INTERNAL SWAP
-    function withdraw(uint256 amount0, uint256 amount1, PoolKey calldata key) external {
+    function withdraw(PoolKey calldata key) external {
+        // TODO (later) amount specific withdrawl
+        // TODO give tokens on basis of staked tokens ratio
+        // Ex: staked $1000 USDC and $1000 ETH so give 50-50
         GovToken govToken = govTokens[key.toId()];
         uint256 userBalance = govToken.balanceOf(msg.sender);
         uint256 totalSupply = govToken.totalSupply();
-        uint256 userShare = (userBalance * 1e18) / totalSupply;
-        uint256 maxWithdrawAmountToken0 = (amount0 * userShare) / 1e18;
-        uint256 maxWithdrawAmountToken1 = (amount1 * userShare) / 1e18;
+        uint256 userShare = (userBalance * 1e8) / totalSupply;
 
-        require(amount0 <= maxWithdrawAmountToken0 && amount1 <= maxWithdrawAmountToken1);
-        govToken.burn(msg.sender, amount0);
-        govToken.burn(msg.sender, amount1);
+        // TODO calculate both token amounts to withdraw and give to user
+        uint256 amount0;
+        uint256 amount1;
 
-        uint256 withdrawAmountToken0 = _withdrawFromStrategy(currentActiveStrategyId, key.currency0, amount0);
-        uint256 withdrawAmountToken1 = _withdrawFromStrategy(currentActiveStrategyId, key.currency1, amount1);
-        ERC20(Currency.unwrap(key.currency0)).transfer(msg.sender, withdrawAmountToken0);
-        ERC20(Currency.unwrap(key.currency1)).transfer(msg.sender, withdrawAmountToken1);
+        govToken.burn(msg.sender, userBalance);
+
+        _withdrawFromStrategy(currentActiveStrategyId, key.currency0, amount0);
+        _withdrawFromStrategy(currentActiveStrategyId, key.currency1, amount1);
+
+        ERC20(Currency.unwrap(key.currency0)).transfer(
+            msg.sender,
+            amount0
+        );
+        ERC20(Currency.unwrap(key.currency1)).transfer(
+            msg.sender,
+            amount1
+        );
 
         // todo calculate token amount for the user, and transfer to user
         // todo multiple user wil store funds here, when one user call this only his liquidty should be removed and transferred to user NOT ALL
@@ -220,7 +255,11 @@ contract JITHook is BaseHook, Owned {
     /**
      * @dev deposits funds to the strategy
      */
-    function _depositToStrategy(uint256 _id, Currency _currency, uint256 _amount) internal {
+    function _depositToStrategy(
+        uint256 _id,
+        Currency _currency,
+        uint256 _amount
+    ) internal {
         address _token = Currency.unwrap(_currency);
         IStrategy(controller.getStrategyAddress(_id)).deposit(_token, _amount);
     }
@@ -228,21 +267,27 @@ contract JITHook is BaseHook, Owned {
     /**
      * @dev withdraws funds from the strategy
      */
-    function _withdrawFromStrategy(uint256 _id, Currency _currency, uint256 amount) internal returns (uint256) {
+    function _withdrawFromStrategy(
+        uint256 _id,
+        Currency _currency,
+        uint256 amount
+    ) internal {
         address token = Currency.unwrap(_currency);
-        return IStrategy(controller.getStrategyAddress(_id)).withdraw(token, amount);
+        IStrategy(controller.getStrategyAddress(_id)).withdraw(token, amount);
     }
 
     /**
      * @dev gets the staked balances of both the pool tokens
      */
-    function _getBalanceFromStrategy(uint256 _id, PoolKey calldata key)
-        internal
-        returns (uint256 balanceOfToken0, uint256 balanceOfToken1)
-    {
+    function _getBalanceFromStrategy(
+        uint256 _id,
+        PoolKey calldata key
+    ) internal returns (uint256 balanceOfToken0, uint256 balanceOfToken1) {
         address token0 = Currency.unwrap(key.currency0);
         address token1 = Currency.unwrap(key.currency1);
-        (balanceOfToken0, balanceOfToken1) = IStrategy(controller.getStrategyAddress(_id)).getBalance(token0, token1);
+        (balanceOfToken0, balanceOfToken1) = IStrategy(
+            controller.getStrategyAddress(_id)
+        ).getBalance(token0, token1);
     }
 
     /**
@@ -256,10 +301,13 @@ contract JITHook is BaseHook, Owned {
         uint128 amount1Max
     ) internal returns (int256 liquidityDelta) {
         // note mint liquidity or add liquidity, liquidity will be provided by non JIT LPs as well ?
-        bytes memory actions = abi.encodePacked(Actions.MINT_POSITION, Actions.SETTLE_PAIR);
+        bytes memory actions = abi.encodePacked(
+            Actions.MINT_POSITION,
+            Actions.SETTLE_PAIR
+        );
         bytes[] memory params = new bytes[](2);
 
-        (, int24 currTick,,) = StateLibrary.getSlot0(poolManager, key.toId());
+        (, int24 currTick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
 
         uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
             TickMath.getSqrtPriceAtTick(currTick),
@@ -269,7 +317,16 @@ contract JITHook is BaseHook, Owned {
             amount1Max
         );
 
-        params[0] = abi.encode(key, tickLower, tickUpper, liquidity, amount0Max, amount1Max, address(this), "");
+        params[0] = abi.encode(
+            key,
+            tickLower,
+            tickUpper,
+            liquidity,
+            amount0Max,
+            amount1Max,
+            address(this),
+            ""
+        );
 
         params[1] = abi.encode(key.currency0, key.currency1);
 
@@ -281,10 +338,10 @@ contract JITHook is BaseHook, Owned {
     /**
      * @dev burns this contract's LP position
      */
-    function _removeLiquidityFromPool(uint128 amount0Min, uint128 amount1Min)
-        internal
-        returns (uint256 amount0, uint256 amount1)
-    {
+    function _removeLiquidityFromPool(
+        uint128 amount0Min,
+        uint128 amount1Min
+    ) internal returns (uint256 amount0, uint256 amount1) {
         // decrease liquidity + take pair (transfer fee revenue) ? OR directly burn position
         bytes memory actions = abi.encodePacked(Actions.BURN_POSITION);
         bytes[] memory params = new bytes[](1);
@@ -297,34 +354,35 @@ contract JITHook is BaseHook, Owned {
     /**
      * @dev gets the swap amount in USD
      */
-    function _getSwapAmount(PoolKey calldata key, IPoolManager.SwapParams calldata params)
-        internal
-        view
-        returns (uint256 amountToSwap)
-    {
+    function _getSwapAmount(
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata params
+    ) internal view returns (uint256 amountToSwap) {
         uint256 precision;
         int256 price;
         int256 amountSpecified = params.amountSpecified;
-        uint256 token0Decimals = ERC20(Currency.unwrap(key.currency0)).decimals();
-        uint256 token1Decimals = ERC20(Currency.unwrap(key.currency1)).decimals();
+        uint256 token0Decimals = ERC20(Currency.unwrap(key.currency0))
+            .decimals();
+        uint256 token1Decimals = ERC20(Currency.unwrap(key.currency1))
+            .decimals();
 
         if (params.zeroForOne) {
             if (params.amountSpecified < 0) {
                 precision = 10 ** token0Decimals;
                 amountSpecified = -amountSpecified;
-                (, price,,,) = priceFeeds[key.currency0].latestRoundData();
+                (, price, , , ) = priceFeeds[key.currency0].latestRoundData();
             } else {
                 precision = 10 ** token1Decimals;
-                (, price,,,) = priceFeeds[key.currency1].latestRoundData();
+                (, price, , , ) = priceFeeds[key.currency1].latestRoundData();
             }
         } else {
             if (params.amountSpecified < 0) {
                 amountSpecified = -amountSpecified;
                 precision = 10 ** token1Decimals;
-                (, price,,,) = priceFeeds[key.currency1].latestRoundData();
+                (, price, , , ) = priceFeeds[key.currency1].latestRoundData();
             } else {
                 precision = 10 ** token0Decimals;
-                (, price,,,) = priceFeeds[key.currency0].latestRoundData();
+                (, price, , , ) = priceFeeds[key.currency0].latestRoundData();
             }
         }
 
@@ -332,40 +390,41 @@ contract JITHook is BaseHook, Owned {
         amountToSwap = (uint256(amountSpecified) * uint256(price)) / precision;
     }
 
-    /// don't think this is needed as providing even less liquidity will reduce slippage for traders
-    function _checkIfHookHasEnoughBalance(PoolKey calldata key, IPoolManager.SwapParams calldata params)
-        internal
-        returns (bool)
-    {
-        (uint256 token0Balance, uint256 token1Balance) = _getBalanceFromStrategy(currentActiveStrategyId, key);
-
-        int256 price;
-        (, price,,,) = priceFeeds[key.currency0].latestRoundData();
-        uint256 token0AmountInUSD =
-            (token0Balance * uint256(price)) / 10 ** ERC20(Currency.unwrap(key.currency0)).decimals();
-
-        (, price,,,) = priceFeeds[key.currency1].latestRoundData();
-        uint256 token1AmountInUSD =
-            (token1Balance * uint256(price)) / 10 ** ERC20(Currency.unwrap(key.currency1)).decimals();
-
-        uint256 totalBalanceInUSD = token0AmountInUSD + token1AmountInUSD;
-
-        return totalBalanceInUSD >= _getSwapAmount(key, params);
-    }
-
     /**
      * @dev withdraws funds from external protocol and swaps them to maintain the pool ratio
      */
-    function _withdrawAndSwap(PoolKey calldata key) internal returns (uint256 amount0, uint256 amount1) {
-        (uint256 token0Balance, uint256 token1Balance) = _getBalanceFromStrategy(currentActiveStrategyId, key);
+    function _withdrawAndSwap(
+        PoolKey calldata key
+    ) internal returns (uint256 amount0, uint256 amount1) {
+        (
+            uint256 token0Balance,
+            uint256 token1Balance
+        ) = _getBalanceFromStrategy(currentActiveStrategyId, key);
 
-        uint256 amountWithdrawn0 = _withdrawFromStrategy(currentActiveStrategyId, key.currency0, token0Balance);
-        uint256 amountWithdrawn1 = _withdrawFromStrategy(currentActiveStrategyId, key.currency1, token1Balance);
+        _withdrawFromStrategy(
+            currentActiveStrategyId,
+            key.currency0,
+            token0Balance
+        );
+        _withdrawFromStrategy(
+            currentActiveStrategyId,
+            key.currency1,
+            token1Balance
+        );
 
-        (, int24 tick,,) = StateLibrary.getSlot0(poolManager, key.toId());
+        (, int24 tick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
         uint160 sqrtPriceX96 = TickMath.getSqrtPriceAtTick(tick);
-        uint256 currentPoolPrice = (uint256(sqrtPriceX96) * uint256(sqrtPriceX96) * 1e18) >> 192;
+        uint256 currentPoolPrice = (uint256(sqrtPriceX96) *
+            uint256(sqrtPriceX96) *
+            1e18) >> 192;
 
+        // x token A, y token B
+        // x -> y
+        // (x - dx) / (y + dy) = pool ratio
+
+        // TODO re-calcutate the amount to swap
+
+        /*
         uint256 amount0 = (token1Balance * 1e18) / currentPoolPrice;
         uint256 amount1 = (token0Balance * currentPoolPrice) / 1e18;
 
@@ -392,6 +451,7 @@ contract JITHook is BaseHook, Owned {
                 }),
                 ""
             );
-        }
+        } 
+        */
     }
 }

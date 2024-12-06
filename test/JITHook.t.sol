@@ -81,6 +81,7 @@ contract JITHookTest is Test, Deployers {
         assertEq(finalUserBalance, initialUserBalance - depositAmount);
         assertEq(finalHookBalance, initialHookBalance + depositAmount);
         
+        // use mock pricefeed for amount of govTokens
         uint256 expectedGovTokens;
         assertEq(hook.govToken().balanceOf(address(this)), expectedGovTokens);
     

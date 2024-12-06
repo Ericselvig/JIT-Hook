@@ -149,8 +149,8 @@ contract JITHook is BaseHook, Owned {
             // withdraw funds from external swap before adding to the pool and
             // check if internal swap is required before adding liquidity
             (
-                uint256 requiredAmount0AccordingToCurrentPoolRatio,
-                uint256 requiredAmount1AccordingToCurrentPoolRatio
+                uint256 amount0ToAddInPool,
+                uint256 amount1ToAddInPool
             ) = _withdrawAndSwap(key);
 
             (, int24 tick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
@@ -160,8 +160,8 @@ contract JITHook is BaseHook, Owned {
                 key,
                 tick - key.tickSpacing,
                 tick + key.tickSpacing,
-                uint128(requiredAmount0AccordingToCurrentPoolRatio),
-                uint128(requiredAmount1AccordingToCurrentPoolRatio)
+                uint128(amount0ToAddInPool),
+                uint128(amount1ToAddInPool)
             );
         }
 
@@ -224,10 +224,9 @@ contract JITHook is BaseHook, Owned {
     }
 
     // funds transferred to small LPs from external protocol
-    // note what if when the user withdraw pair of tokens, that ratio is changed
-    // we accept deposit in proper ratio so we must withdraw in current ratio as well
-    // INTERNAL SWAP
-    // key 
+    // TODO 
+    // key: currency0, currency1 => not deposited in external protocol because no one deposited it ?????
+    // without key, what tokens will returned ? 
     function withdraw(PoolKey calldata key) external {
         // TODO (later) amount specific withdrawl
         // TODO give tokens on basis of staked tokens ratio
@@ -351,7 +350,7 @@ contract JITHook is BaseHook, Owned {
     function _removeLiquidityFromPool(
         uint128 amount0Min,
         uint128 amount1Min
-    ) internal returns (uint256 amount0, uint256 amount1) {
+    ) internal {
         // decrease liquidity + take pair (transfer fee revenue) ? OR directly burn position
         bytes memory actions = abi.encodePacked(Actions.BURN_POSITION);
         bytes[] memory params = new bytes[](1);
@@ -427,35 +426,36 @@ contract JITHook is BaseHook, Owned {
         // current price ratio 
         (, int24 tick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
         uint160 sqrtPriceX96 = TickMath.getSqrtPriceAtTick(tick);
-        uint256 currentPoolPrice = (uint256(sqrtPriceX96) *
-            uint256(sqrtPriceX96) *
-            1e18) >> 192;
+
+        // P = y/x 
+        uint256 currentPrice = (uint256(sqrtPriceX96) * uint256(sqrtPriceX96) * 1e18) >> 192;
 
         // x token A, y token B
         // x -> y
         // (x - dx) / (y + dy) = pool ratio
 
-        // TODO re-calcutate the amount to swap
         // amount pair in this hook contract => in ratio wrt to the pool ratio
+        // our ratio is (x * P) / y
+        // if ratio = 1e18, we are in perfect ratio
+        // if ratio > 1e18, we have too much token0 relative to token1
+        // if ratio < 1e18, we have too much token1 relative to token0
+        uint256 ourRatio = (token0Balance * currentPrice) / token1Balance;
 
-        /*
-        uint256 amount0 = (token1Balance * 1e18) / currentPoolPrice;
-        uint256 amount1 = (token0Balance * currentPoolPrice) / 1e18;
-
-        if (token0Balance > amount0) {
-            // swap token0 for token1
+        if (ourRatio > 1e18) {
+            // We have too much token0 relative to token1
+            uint256 excessAmount0 = token0Balance - ((token1Balance * 1e18) / currentPrice);
             poolManager.swap(
                 key,
                 IPoolManager.SwapParams({
                     zeroForOne: true,
-                    amountSpecified: int256(token0Balance - amount0),
+                    amountSpecified: int256(excessAmount0),
                     sqrtPriceLimitX96: 0
                 }),
                 ""
             );
-        } else if (token1Balance > amount1) {
-            // swap token1 for token0
-            uint256 excessAmount1 = token1Balance - amount1;
+        } else if (ourRatio < 1e18) {
+            // We have too much token1 relative to token0
+            uint256 excessAmount1 = token1Balance - ((token0Balance * currentPrice) / 1e18);
             poolManager.swap(
                 key,
                 IPoolManager.SwapParams({
@@ -465,7 +465,10 @@ contract JITHook is BaseHook, Owned {
                 }),
                 ""
             );
-        } 
-        */
+        }
+        uint256 newToken0Balance = ERC20(Currency.unwrap(key.currency0)).balanceOf(address(this));
+        uint256 newToken1Balance = ERC20(Currency.unwrap(key.currency1)).balanceOf(address(this));
+        return (newToken0Balance, newToken1Balance);
+            
     }
 }

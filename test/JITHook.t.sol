@@ -6,16 +6,18 @@ import {Test} from "forge-std/Test.sol";
 import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 
-import {PoolManager} from "v4-core/PoolManager.sol";
-import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
-import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
-import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
-import {PoolKey} from "v4-core/types/PoolKey.sol";
+import {PoolManager} from "v4-core/src/PoolManager.sol";
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 
-import {Hooks} from "v4-core/libraries/Hooks.sol";
-import {TickMath} from "v4-core/libraries/TickMath.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
+import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+
+import {Hooks} from "v4-core/src/libraries/Hooks.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 
 import {JITHook} from "../src/JITHook.sol";
 
@@ -69,7 +71,7 @@ contract JITHookTest is Test, Deployers {
         uint256 initialUserBalance = MockERC20(Currency.unwrap(token0)).balanceOf(address(this));
         uint256 initialHookBalance = MockERC20(Currency.unwrap(token0)).balanceOf(address(hook));
         // deposit
-        hook.deposit(token0, depositAmount, key);
+        hook.deposit(token0, depositAmount);
         
         // Get final balances
         uint256 finalUserBalance = MockERC20(Currency.unwrap(token0)).balanceOf(address(this));
@@ -80,7 +82,7 @@ contract JITHookTest is Test, Deployers {
         assertEq(finalHookBalance, initialHookBalance + depositAmount);
         
         uint256 expectedGovTokens;
-        assertEq(hook.govToken.balanceOf(address(this)), expectedGovTokens);
+        assertEq(hook.govToken().balanceOf(address(this)), expectedGovTokens);
     
     }
 

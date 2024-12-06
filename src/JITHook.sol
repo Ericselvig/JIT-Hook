@@ -48,7 +48,7 @@ contract JITHook is BaseHook, Owned {
     uint256 public currentActiveStrategyId;
 
     // mapping(PoolKey => GovToken) public govTokens;
-    mapping(PoolId => GovToken) public govTokens;
+    GovToken public govToken;
 
     constructor(
         IPoolManager _manager,
@@ -59,6 +59,7 @@ contract JITHook is BaseHook, Owned {
         controller = IStrategiesController(_strategiesController);
         swapThreshold = _threshold;
         positionManager = IPositionManager(_posManager);
+        govToken = new GovToken("GovTkn", "GVT");
     }
 
     /**
@@ -100,30 +101,31 @@ contract JITHook is BaseHook, Owned {
 
     /**
      * @dev hook to initialize the governance token for a pool
+     * note not creating different tokens for each pool
      */
-    function afterInitialize(
-        address,
-        PoolKey calldata key,
-        uint160,
-        int24
-    ) external override returns (bytes4) {
-        string memory name = string.concat(
-            "Governance token: ",
-            ERC20(Currency.unwrap(key.currency0)).symbol(),
-            "-",
-            ERC20(Currency.unwrap(key.currency1)).symbol(),
-            Strings.toString(key.fee)
-        );
-        string memory symbol = string.concat(
-            ERC20(Currency.unwrap(key.currency0)).symbol(),
-            "-",
-            ERC20(Currency.unwrap(key.currency1)).symbol(),
-            Strings.toString(key.fee)
-        );
-        govTokens[key.toId()] = new GovToken(name, symbol);
+    // function afterInitialize(
+    //     address,
+    //     PoolKey calldata key,
+    //     uint160,
+    //     int24
+    // ) external override returns (bytes4) {
+    //     string memory name = string.concat(
+    //         "Governance token: ",
+    //         ERC20(Currency.unwrap(key.currency0)).symbol(),
+    //         "-",
+    //         ERC20(Currency.unwrap(key.currency1)).symbol(),
+    //         Strings.toString(key.fee)
+    //     );
+    //     string memory symbol = string.concat(
+    //         ERC20(Currency.unwrap(key.currency0)).symbol(),
+    //         "-",
+    //         ERC20(Currency.unwrap(key.currency1)).symbol(),
+    //         Strings.toString(key.fee)
+    //     );
+    //     govTokens[key.toId()] = new GovToken(name, symbol);
 
-        return this.afterInitialize.selector;
-    }
+    //     return this.afterInitialize.selector;
+    // }
 
     /**
      * @dev detect big swap and provide liquidity to the pool
@@ -142,6 +144,7 @@ contract JITHook is BaseHook, Owned {
             );
         }
 
+        // Converting swap amount into USD as well to compare 
         if (_getSwapAmount(key, params) >= swapThreshold) {
             // withdraw funds from external swap before adding to the pool and
             // check if internal swap is required before adding liquidity
@@ -199,6 +202,7 @@ contract JITHook is BaseHook, Owned {
         Currency currency,
         uint256 amount
     ) external {
+        
         ERC20(Currency.unwrap(currency)).transferFrom(
             msg.sender,
             address(this),
@@ -207,8 +211,13 @@ contract JITHook is BaseHook, Owned {
 
         // TODO instead of minting amounts directly, calculate the total USD value and mint that
         if (amount > 0) {
+            (, int256 price, , ,) = priceFeeds[currency].latestRoundData();
+            uint256 usdValue = (uint256(price) * amount) / 1e8;
+
+            // deposit to strategy (currency => amount)
             _depositToStrategy(currentActiveStrategyId, currency, amount);
-            govTokens[key.toId()].mint(msg.sender, amount0);
+            // mint gove Token => usdValue 
+            govToken.mint(msg.sender, usdValue);
         }
 
         // todo emit event
@@ -218,11 +227,12 @@ contract JITHook is BaseHook, Owned {
     // note what if when the user withdraw pair of tokens, that ratio is changed
     // we accept deposit in proper ratio so we must withdraw in current ratio as well
     // INTERNAL SWAP
+    // key 
     function withdraw(PoolKey calldata key) external {
         // TODO (later) amount specific withdrawl
         // TODO give tokens on basis of staked tokens ratio
         // Ex: staked $1000 USDC and $1000 ETH so give 50-50
-        GovToken govToken = govTokens[key.toId()];
+        // GovToken govToken = govTokens[key.toId()];
         uint256 userBalance = govToken.balanceOf(msg.sender);
         uint256 totalSupply = govToken.totalSupply();
         uint256 userShare = (userBalance * 1e8) / totalSupply;
@@ -282,7 +292,7 @@ contract JITHook is BaseHook, Owned {
     function _getBalanceFromStrategy(
         uint256 _id,
         PoolKey calldata key
-    ) internal returns (uint256 balanceOfToken0, uint256 balanceOfToken1) {
+    ) internal view returns (uint256 balanceOfToken0, uint256 balanceOfToken1) {
         address token0 = Currency.unwrap(key.currency0);
         address token1 = Currency.unwrap(key.currency1);
         (balanceOfToken0, balanceOfToken1) = IStrategy(
@@ -291,7 +301,7 @@ contract JITHook is BaseHook, Owned {
     }
 
     /**
-     * @dev mints a new LP position
+     * @dev mints a new LP position, used  in beforeSwap hook
      */
     function _addLiquidityToPool(
         PoolKey memory key,
@@ -336,7 +346,7 @@ contract JITHook is BaseHook, Owned {
     }
 
     /**
-     * @dev burns this contract's LP position
+     * @dev burns this contract's LP position, used in afterSwap hook
      */
     function _removeLiquidityFromPool(
         uint128 amount0Min,
@@ -401,6 +411,9 @@ contract JITHook is BaseHook, Owned {
             uint256 token1Balance
         ) = _getBalanceFromStrategy(currentActiveStrategyId, key);
 
+
+        // not withdrawing the entire balance, 
+        // because in future we will allow user to withdraw some specific amount of funds [right now it is complete balance]
         _withdrawFromStrategy(
             currentActiveStrategyId,
             key.currency0,
@@ -411,7 +424,7 @@ contract JITHook is BaseHook, Owned {
             key.currency1,
             token1Balance
         );
-
+        // current price ratio 
         (, int24 tick, , ) = StateLibrary.getSlot0(poolManager, key.toId());
         uint160 sqrtPriceX96 = TickMath.getSqrtPriceAtTick(tick);
         uint256 currentPoolPrice = (uint256(sqrtPriceX96) *
@@ -423,6 +436,7 @@ contract JITHook is BaseHook, Owned {
         // (x - dx) / (y + dy) = pool ratio
 
         // TODO re-calcutate the amount to swap
+        // amount pair in this hook contract => in ratio wrt to the pool ratio
 
         /*
         uint256 amount0 = (token1Balance * 1e18) / currentPoolPrice;

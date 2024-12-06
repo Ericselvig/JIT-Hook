@@ -17,15 +17,15 @@ contract GovToken is ERC20, Owned {
         _burn(from, amount);
     }
 
-    function approve(address spender, uint256 amount) public override returns (bool) {
+    function approve(address spender, uint256 amount) public pure override returns (bool) {
         revert Not_Allowed();
     }
 
-    function transferFrom(address from, address to, uint256 amount) public override returns (bool) {
+    function transferFrom(address from, address to, uint256 amount) public pure override returns (bool) {
         revert Not_Allowed();
     }
 
-    function transfer(address to, uint256 amount) public override returns (bool) {
+    function transfer(address to, uint256 amount) public pure override returns (bool) {
         revert Not_Allowed();
     }
 }

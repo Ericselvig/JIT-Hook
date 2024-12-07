@@ -1,27 +1,30 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {BaseHook} from "v4-periphery/src/base/hooks/BaseHook.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
+import {IStrategiesController} from "./interfaces/IStrategiesController.sol";
+import {IStrategy} from "./interfaces/IStrategy.sol";
+import {GovToken} from "./governance/GovToken.sol";
+
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
-import {ERC20} from "solmate/src/tokens/ERC20.sol";
 import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
-import {IStrategiesController} from "./interfaces/IStrategiesController.sol";
-import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
-import {IStrategy} from "./interfaces/IStrategy.sol";
-import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
-import {Actions} from "v4-periphery/src/libraries/Actions.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {LiquidityAmounts} from "v4-core/test/utils/LiquidityAmounts.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
-import {GovToken} from "./governance/GovToken.sol";
+import {BaseHook} from "v4-periphery/src/base/hooks/BaseHook.sol";
+import {Actions} from "v4-periphery/src/libraries/Actions.sol";
+
+import {ERC20} from "solmate/src/tokens/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
-import {Owned} from "solmate/src/auth/Owned.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
+import {Owned} from "solmate/src/auth/Owned.sol";
+
+import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
 /**
  * @title JITHook
@@ -33,9 +36,20 @@ contract JITHook is BaseHook, Owned {
     using CurrencyLibrary for Currency;
     using BeforeSwapDeltaLibrary for BeforeSwapDelta;
 
+    //////////////
+    /// EVENTS ///
+    //////////////
+
+    event PriceFeedSet(Currency currency, AggregatorV3Interface priceFeed);
+    event Deposit(address indexed user, Currency currency, uint256 amount);
+    event Withdraw(address indexed user, Currency currency, uint256 amount);
+    event SwapThresholdSet(PoolId pid, uint256 threshold);
+
+    uint256 public constant USD_PRECISION = 1e8;
+
     mapping(Currency currency => AggregatorV3Interface priceFeed) priceFeeds;
 
-    uint256 public swapThreshold; // swap threshold in USD (8 decimals)
+    mapping(PoolId => uint256) public swapThresholds; // swap thresholds in USD (8 decimals)
     IStrategiesController public controller;
     IPositionManager public positionManager;
     uint256 public currentPositionId;
@@ -45,11 +59,9 @@ contract JITHook is BaseHook, Owned {
     constructor(
         IPoolManager _manager,
         address _strategiesController,
-        uint256 _threshold,
         address _posManager
     ) BaseHook(_manager) Owned(msg.sender) {
         controller = IStrategiesController(_strategiesController);
-        swapThreshold = _threshold;
         positionManager = IPositionManager(_posManager);
         govToken = new GovToken("GovTkn", "GVT");
     }
@@ -64,6 +76,20 @@ contract JITHook is BaseHook, Owned {
         address priceFeed
     ) external onlyOwner {
         priceFeeds[currency] = AggregatorV3Interface(priceFeed);
+        emit PriceFeedSet(currency, AggregatorV3Interface(priceFeed));
+    }
+
+    /**
+     * @notice set the swap threshold for the given pool
+     * @param _pid the pool id for which the swap threshold is to be set
+     * @param _threshold the threshold in USD (8 decimals)
+     */
+    function setSwapThreshold(
+        PoolId _pid,
+        uint256 _threshold
+    ) external onlyOwner {
+        swapThresholds[_pid] = _threshold;
+        emit SwapThresholdSet(_pid, _threshold);
     }
 
     function getHookPermissions()
@@ -75,7 +101,7 @@ contract JITHook is BaseHook, Owned {
         return
             Hooks.Permissions({
                 beforeInitialize: false,
-                afterInitialize: true,
+                afterInitialize: false,
                 beforeAddLiquidity: false,
                 afterAddLiquidity: false,
                 beforeRemoveLiquidity: false,
@@ -108,7 +134,7 @@ contract JITHook is BaseHook, Owned {
             );
         }
 
-        if (_getSwapAmount(key, params) >= swapThreshold) {
+        if (_getSwapAmount(key, params) >= swapThresholds[key.toId()]) {
             (
                 uint256 amount0ToAddInPool,
                 uint256 amount1ToAddInPool
@@ -168,10 +194,12 @@ contract JITHook is BaseHook, Owned {
 
         if (amount > 0) {
             (, int256 price, , , ) = priceFeeds[currency].latestRoundData();
-            uint256 usdValue = (uint256(price) * amount) / 1e8;
+            uint256 usdValue = (uint256(price) * amount) / USD_PRECISION;
             _depositToStrategy(currentActiveStrategyId, currency, amount);
             govToken.mint(msg.sender, usdValue);
         }
+
+        emit Deposit(msg.sender, currency, amount);
     }
 
     /**
@@ -181,7 +209,7 @@ contract JITHook is BaseHook, Owned {
     function withdraw(PoolKey calldata key) external {
         uint256 userBalance = govToken.balanceOf(msg.sender);
         uint256 totalSupply = govToken.totalSupply();
-        uint256 userShare = (userBalance * 1e8) / totalSupply;
+        uint256 userShare = (userBalance * USD_PRECISION) / totalSupply;
 
         uint256 amount0;
         uint256 amount1;
@@ -193,6 +221,8 @@ contract JITHook is BaseHook, Owned {
 
         ERC20(Currency.unwrap(key.currency0)).transfer(msg.sender, amount0);
         ERC20(Currency.unwrap(key.currency1)).transfer(msg.sender, amount1);
+
+        emit Withdraw(msg.sender, key.currency0, amount0);
     }
 
     /**
@@ -242,7 +272,7 @@ contract JITHook is BaseHook, Owned {
         int24 tickUpper,
         uint128 amount0Max,
         uint128 amount1Max
-    ) internal returns (int256 liquidityDelta) {
+    ) internal {
         bytes memory actions = abi.encodePacked(
             Actions.MINT_POSITION,
             Actions.SETTLE_PAIR
